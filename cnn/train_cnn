@@ -1,0 +1,92 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+# Building the CNN model
+def build_drowsiness_cnn():
+    model = models.Sequential()
+
+    # Layer 1: Conv -> ReLU -> MaxPooling -> Dropout
+    model.add(layers.Conv2D(32, (3, 3), padding='same', activation='relu', input_shape=(28, 28, 1)))
+    model.add(layers.MaxPooling2D((2, 2)))
+    model.add(layers.Dropout(0.25))
+
+    # Layer 2: Conv -> ReLU -> MaxPooling -> Dropout
+    model.add(layers.Conv2D(64, (3, 3), padding='same', activation='relu'))
+    model.add(layers.MaxPooling2D((2, 2)))
+    model.add(layers.Dropout(0.25))
+
+    # Layer 3: Conv -> ReLU -> MaxPooling -> Dropout
+    model.add(layers.Conv2D(64, (3, 3), padding='same', activation='relu'))
+    model.add(layers.MaxPooling2D((2, 2)))
+    #model.add(layers.Dropout(0.25))
+
+    # Layer 4: Conv -> ReLU -> MaxPooling
+    model.add(layers.Conv2D(128, (3, 3), padding='same', activation='relu'))
+    model.add(layers.MaxPooling2D((2, 2)))
+
+    # Flatten Layer
+    model.add(layers.Flatten())
+
+    # Fully Connected Layers
+    model.add(layers.Dense(128, activation='relu'))
+
+    # Output Layer (Sigmoid for binary classification)
+    model.add(layers.Dense(1, activation='sigmoid'))
+
+    return model
+
+# Create the model
+model = build_drowsiness_cnn()
+
+# Compile the model
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Summary of the model
+model.summary()
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+# Set the base directory for the dataset
+base_dir = '/content/drive/MyDrive/DROWSINESS_DETECTION/eye_detection/kaggle_reference'
+
+# Create an ImageDataGenerator for training data
+train_datagen = ImageDataGenerator(
+    rescale=1./255,  # Normalize pixel values to [0, 1]
+    rotation_range=20,  # Randomly rotate images in the range (degrees, 0 to 20)
+    width_shift_range=0.2,  # Randomly shift images horizontally
+    height_shift_range=0.2,  # Randomly shift images vertically
+    shear_range=0.2,  # Shear angle in counter-clockwise direction in degrees
+    zoom_range=0.2,  # Randomly zoom into images
+    horizontal_flip=True,  # Randomly flip images
+    fill_mode='nearest',  # Fill in new pixels
+    validation_split=0.2  # Split data into training and validation sets
+)
+
+# Load training data
+train_generator = train_datagen.flow_from_directory(
+    base_dir,
+    target_size=(28, 28),  # Resize images to 28x28
+    color_mode='grayscale',  # Load images in grayscale
+    batch_size=32,
+    class_mode='binary',  # Assuming binary classification (open/closed)
+    subset='training'  # Set as training data
+)
+
+# Load validation data
+validation_generator = train_datagen.flow_from_directory(
+    base_dir,
+    target_size=(28, 28),  # Resize images to 28x28
+    color_mode='grayscale',  # Load images in grayscale
+    batch_size=32,
+    class_mode='binary',  # Assuming binary classification (open/closed)
+    subset='validation'  # Set as validation data
+)
+
+# Train the model
+history = model.fit(
+    train_generator,
+    validation_data=validation_generator,
+    epochs=60,  # Adjust the number of epochs as needed
+    steps_per_epoch=train_generator.samples // train_generator.batch_size,
+    validation_steps=validation_generator.samples // validation_generator.batch_size
+)
