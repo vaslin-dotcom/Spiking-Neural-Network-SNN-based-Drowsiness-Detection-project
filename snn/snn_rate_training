@@ -1,0 +1,187 @@
+from __future__ import print_function
+import torchvision
+
+import torchvision.transforms as transforms
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import os
+import time
+import torch.nn.functional as F
+
+# Set up device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Hyperparameters and constants
+thresh = 0.5    # Neuronal threshold
+lens = 0.5      # Hyper-parameter of the approximate function
+decay = 0.2     # Decay constant
+num_classes = 10
+batch_size = 100
+learning_rate = 1e-3
+num_epochs = 60
+time_window = 20  # Simulation time steps
+
+# Define the approximate firing function
+class ActFun(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return input.gt(thresh).float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        temp = abs(input - thresh) < lens
+        return grad_input * temp.float()
+
+act_fun = ActFun.apply
+
+# Membrane potential update
+def mem_update(ops, x, mem, spike):
+    mem = mem * decay * (1. - spike) + ops(x)
+    spike = act_fun(mem)  # Apply firing function
+    return mem, spike
+
+# CNN layer configuration (64x64 input)
+cfg_cnn = [(1, 32, 1, 1, 3),
+           (32, 32, 1, 1, 3)]
+cfg_kernel = [28,14,7]  # Updated for 64x64 input
+cfg_fc = [128, 2]
+
+# Define learning rate scheduler
+def lr_scheduler(optimizer, epoch, init_lr=0.1, lr_decay_epoch=50):
+    if epoch % lr_decay_epoch == 0 and epoch > 1:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = param_group['lr'] * 0.1
+    return optimizer
+
+# Define Spiking CNN
+class SCNN(nn.Module):
+    def __init__(self):
+        super(SCNN, self).__init__()
+        in_planes, out_planes, stride, padding, kernel_size = cfg_cnn[0]
+        self.conv1 = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding)
+        in_planes, out_planes, stride, padding, kernel_size = cfg_cnn[1]
+        self.conv2 = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding)
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(cfg_kernel[-1] * cfg_kernel[-1] * cfg_cnn[-1][1], cfg_fc[0])
+        self.fc2 = nn.Linear(cfg_fc[0], cfg_fc[1])
+
+    def forward(self, input, time_window=time_window):
+        batch_size = input.size(0)
+        c1_mem = c1_spike = torch.zeros(batch_size, cfg_cnn[0][1], cfg_kernel[0], cfg_kernel[0], device=device)
+        c2_mem = c2_spike = torch.zeros(batch_size, cfg_cnn[1][1], cfg_kernel[1], cfg_kernel[1], device=device)
+        h1_mem = h1_spike = h1_sumspike = torch.zeros(batch_size, cfg_fc[0], device=device)
+        h2_mem = h2_spike = h2_sumspike = torch.zeros(batch_size, cfg_fc[1], device=device)
+
+        for step in range(time_window):
+            x = input > torch.rand(input.size(), device=device)
+            c1_mem, c1_spike = mem_update(self.conv1, x.float(), c1_mem, c1_spike)
+            x = F.avg_pool2d(c1_spike, 2)
+            c2_mem, c2_spike = mem_update(self.conv2, x, c2_mem, c2_spike)
+            x = F.avg_pool2d(c2_spike, 2)
+            x = x.view(batch_size, -1)
+            h1_mem, h1_spike = mem_update(self.fc1, x, h1_mem, h1_spike)
+            h1_sumspike += h1_spike
+            h2_mem, h2_spike = mem_update(self.fc2, h1_spike, h2_mem, h2_spike)
+            h2_sumspike += h2_spike
+
+        outputs = h2_sumspike / time_window
+        return outputs
+
+# Paths for dataset
+train_data_path = r'/content/drive/MyDrive/DROWSINESS_DETECTION/eye_detection/kaggle_reference'
+test_data_path = r'/content/drive/MyDrive/test'
+
+# Data transformations
+transform = transforms.Compose([
+    transforms.Grayscale(),
+    transforms.Resize((28,28)),
+    transforms.ToTensor(),
+])
+
+# Load dataset using ImageFolder
+train_dataset = torchvision.datasets.ImageFolder(root=train_data_path, transform=transform)
+test_dataset = torchvision.datasets.ImageFolder(root=test_data_path, transform=transform)
+
+# DataLoaders
+train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+# Initialize model, loss function, and optimizer
+snn = SCNN().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(snn.parameters(), lr=learning_rate)
+
+best_acc = 0
+acc_record = []
+
+# Training loop
+for epoch in range(num_epochs):
+    snn.train()
+    running_loss = 0
+    start_time = time.time()
+
+    for i, (images, labels) in enumerate(train_loader):
+        images = images.float().to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = snn(images)
+        loss = criterion(outputs, labels)
+        running_loss += loss.item()
+
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+
+        if (i + 1) % 100 == 0:
+            print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], Loss: {running_loss:.5f}')
+            running_loss = 0
+            print('Time elapsed:', time.time() - start_time)
+
+    # Test the model after each epoch
+    snn.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = snn(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    acc = 100 * correct / total
+    acc_record.append(acc)
+    print(f'Epoch [{epoch + 1}/{num_epochs}], Test Accuracy: {acc:.3f}%')
+
+    # Adjust learning rate
+    optimizer = lr_scheduler(optimizer, epoch, learning_rate, 40)
+
+    # Save the model checkpoint if accuracy improves
+    if acc > best_acc:
+        print('Saving model...')
+        state = {
+            'net': snn.state_dict(),
+            'acc': acc,
+            'epoch': epoch,
+            'acc_record': acc_record,
+        }
+        if not os.path.exists('checkpoint'):
+            os.mkdir('checkpoint')
+        torch.save(state, f'./checkpoint/snn_epoch_{epoch}.pth')
+        best_acc = acc
+
+# Define the path to save the model
+model_save_path = '/content/drive/MyDrive/DROWSINESS_DETECTION/eye_detection_snn_model_10_rate.pth'
+torch.save(snn, model_save_path)
+print(f'Model saved to {model_save_path}')
+
+
